@@ -7,15 +7,16 @@ import requests
 import nltk
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 import datetime
+import os
 
 # Descargar recursos necesarios para NLTK
 nltk.download('vader_lexicon')
 
+# Configuración
+NEWS_API_KEY = os.environ.get('NEWS_API_KEY', 'tu_clave_aquí')  # Obtener de variables de entorno o usar valor predeterminado
+
 app = Flask(__name__)
 CORS(app)  # Habilitar CORS para todas las rutas
-
-# API Key para newsapi.org (necesitarás registrarte para obtener una)
-NEWS_API_KEY = "db9b44c9184147189eb82797c8d499e0"
 
 def get_stock_data(symbol):
     """Obtener datos históricos de acciones"""
@@ -39,21 +40,29 @@ def predict_stock(symbol):
 
 def get_news(symbol):
     """Obtener noticias relacionadas con un símbolo de acción"""
-    company_name = yf.Ticker(symbol).info.get('shortName', symbol)
-    
-    # Calcular fecha de hace una semana
-    today = datetime.datetime.now()
-    week_ago = today - datetime.datetime(days=7)
-    
-    # Consultar API de noticias
-    url = f"https://newsapi.org/v2/everything?q={company_name}&from={week_ago.strftime('%Y-%m-%d')}&sortBy=popularity&apiKey={NEWS_API_KEY}"
-    
-    response = requests.get(url)
-    if response.status_code != 200:
+    try:
+        company_name = yf.Ticker(symbol).info.get('shortName', symbol)
+        
+        # Calcular fecha de hace una semana
+        today = datetime.datetime.now()
+        week_ago = today - datetime.timedelta(days=7)
+        
+        # Consultar API de noticias
+        url = f"https://newsapi.org/v2/everything?q={company_name}&from={week_ago.strftime('%Y-%m-%d')}&sortBy=popularity&apiKey={NEWS_API_KEY}"
+        
+        response = requests.get(url)
+        if response.status_code != 200:
+            print(f"Error al obtener noticias: {response.status_code}")
+            return []
+        
+        news_data = response.json()
+        
+        # Procesar y devolver noticias
+        articles = news_data.get('articles', [])
+        return articles
+    except Exception as e:
+        print(f"Error en get_news: {str(e)}")
         return []
-    
-    news_data = response.json()
-    return news_data.get('articles', [])
 
 def analyze_news_sentiment(news_articles):
     """Analizar el sentimiento de las noticias"""
@@ -84,6 +93,10 @@ def analyze_news_sentiment(news_articles):
         "neutral": neutral
     }
 
+@app.route('/')
+def home():
+    return jsonify({"status": "API is running"})
+
 @app.route('/predict', methods=['GET'])
 def predict():
     """Endpoint para predecir precios de acciones"""
@@ -109,23 +122,28 @@ def sentiment():
 @app.route('/market-prediction', methods=['GET'])
 def market_prediction():
     """Endpoint para obtener predicción combinada (precio + noticias)"""
-    symbol = request.args.get('symbol', 'AAPL')
-    
-    # Obtener predicciones de precio
-    price_predictions = predict_stock(symbol)
-    
-    # Obtener análisis de sentimiento
-    news_articles = get_news(symbol)
-    sentiment_analysis = analyze_news_sentiment(news_articles)
-    
-    # Combinar resultados
-    result = {
-        "price_predictions": price_predictions,
-        "sentiment_analysis": sentiment_analysis,
-        "news": news_articles[:5]  # Incluir las 5 noticias más relevantes
-    }
-    
-    return jsonify(result)
+    try:
+        symbol = request.args.get('symbol', 'AAPL')
+        
+        # Obtener predicciones de precio
+        price_predictions = predict_stock(symbol)
+        
+        # Obtener análisis de sentimiento
+        news_articles = get_news(symbol)
+        sentiment_analysis = analyze_news_sentiment(news_articles)
+        
+        # Combinar resultados
+        result = {
+            "price_predictions": price_predictions,
+            "sentiment_analysis": sentiment_analysis,
+            "news": news_articles[:5]  # Incluir las 5 noticias más relevantes
+        }
+        
+        return jsonify(result)
+    except Exception as e:
+        print(f"Error en market_prediction: {str(e)}")
+        # Devolver un mensaje de error y código de estado 500
+        return jsonify({"error": str(e), "message": "Error al procesar la solicitud"}), 500
 
 if __name__ == '__main__':
     # Modo desarrollo local
