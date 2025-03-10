@@ -8,6 +8,7 @@ import nltk
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 import datetime
 import os
+from finance_api import register_finance_routes
 
 # Descargar recursos necesarios para NLTK
 nltk.download('vader_lexicon')
@@ -17,6 +18,9 @@ NEWS_API_KEY = os.environ.get('NEWS_API_KEY', 'tu_clave_aquí')  # Obtener de va
 
 app = Flask(__name__)
 CORS(app)  # Habilitar CORS para todas las rutas
+
+# Register financial routes
+register_finance_routes(app)
 
 def get_stock_data(symbol):
     """Obtener datos históricos de acciones"""
