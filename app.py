@@ -71,20 +71,54 @@ def generate_mock_predictions(symbol):
     today = datetime.datetime.now()
     predictions = []
     
-    base_price = 150.0  # Precio base ficticio
+    # Generar un precio base usando el hash del símbolo para que sea consistente
+    seed = sum(ord(c) for c in symbol)
+    base_price = 100.0 + (seed % 200)  # Precio base entre 100 y 300
+    
+    # Tendencia diaria (entre -0.5% y +1.5%)
+    trend = 0.5 + (seed % 10) / 10.0  # Entre 0.5% y 1.5%
+    if seed % 3 == 0:  # Un tercio de las veces, tendencia negativa
+        trend = -trend / 2  # Tendencia negativa más suave
+    
+    current_price = base_price
     
     for i in range(30):
         # Generar una fecha futura
         future_date = today + datetime.timedelta(days=i)
-        # Generar un precio simulado con una tendencia alcista leve
-        predicted_price = base_price + (i * 0.5) + (((hash(symbol) % 10) - 5) * 0.2)
         
-        predictions.append({
+        # Calcular variación diaria (ruido aleatorio)
+        daily_variation = ((seed + i) % 10 - 4) / 10.0  # Entre -0.4% y +0.5%
+        
+        # Aplicar tendencia y variación
+        if i > 0:
+            current_price = predictions[i-1]['yhat'] * (1 + (trend + daily_variation) / 100)
+        
+        # Calcular límites inferior y superior
+        lower_bound = current_price * (1 - (0.5 + (i * 0.1)) / 100)
+        upper_bound = current_price * (1 + (0.5 + (i * 0.1)) / 100)
+        
+        # Crear predicción
+        prediction = {
             'ds': future_date.strftime("%Y-%m-%d"),
-            'yhat': round(predicted_price, 2),
-            'yhat_lower': round(predicted_price * 0.95, 2),
-            'yhat_upper': round(predicted_price * 1.05, 2)
-        })
+            'yhat': round(current_price, 2),
+            'yhat_lower': round(lower_bound, 2),
+            'yhat_upper': round(upper_bound, 2)
+        }
+        
+        # Añadir porcentajes de cambio
+        if i == 0:
+            prediction['pct_change'] = 0.0
+            prediction['daily_pct'] = 0.0
+        else:
+            # Cambio desde el precio base
+            pct_change = ((current_price - base_price) / base_price) * 100
+            prediction['pct_change'] = round(pct_change, 2)
+            
+            # Cambio diario
+            daily_pct = ((current_price - predictions[i-1]['yhat']) / predictions[i-1]['yhat']) * 100
+            prediction['daily_pct'] = round(daily_pct, 2)
+        
+        predictions.append(prediction)
     
     return predictions
 
@@ -144,49 +178,76 @@ def analyze_news_sentiment(news_articles):
             print("No hay noticias para analizar, devolviendo sentimiento neutral")
             return {
                 'compound': 0.0,
-                'positive': 0.0, 
-                'negative': 0.0, 
-                'neutral': 1.0
+                'neg': 0.33, 
+                'pos': 0.33, 
+                'neu': 0.34
             }
         
         # Inicializar analizador
         analyzer = SentimentIntensityAnalyzer()
         
-        # Agregar textos de noticias
-        all_text = ""
+        # Recopilar sentimientos de cada artículo individualmente
+        all_sentiments = []
         for article in news_articles:
             # Obtener texto de título y descripción, si están disponibles
             title = article.get('title', '')
             description = article.get('description', '')
             
+            text = ""
             if title:
-                all_text += title + " "
+                text += title + ". "
             if description:
-                all_text += description + " "
+                text += description
+                
+            # Solo analizar si hay texto
+            if text.strip():
+                sentiment = analyzer.polarity_scores(text)
+                all_sentiments.append(sentiment)
         
-        # Si después de todo no tenemos texto, devolver neutro
-        if not all_text.strip():
-            print("No se pudo extraer texto de las noticias")
+        # Si no se pudo analizar ningún artículo
+        if not all_sentiments:
+            print("No se pudo analizar ningún artículo")
             return {
                 'compound': 0.0,
-                'positive': 0.0, 
-                'negative': 0.0, 
-                'neutral': 1.0
+                'neg': 0.33, 
+                'pos': 0.33, 
+                'neu': 0.34
             }
             
-        # Analizar sentimiento
-        sentiment = analyzer.polarity_scores(all_text)
-        print(f"Análisis de sentimiento completado: {sentiment}")
+        # Calcular promedio de sentimientos
+        compound = sum(s['compound'] for s in all_sentiments) / len(all_sentiments)
+        positive = sum(s['pos'] for s in all_sentiments) / len(all_sentiments)
+        negative = sum(s['neg'] for s in all_sentiments) / len(all_sentiments)
+        neutral = sum(s['neu'] for s in all_sentiments) / len(all_sentiments)
         
-        return sentiment
+        # Balancear el sentimiento compound (no dejarlo tan extremo)
+        # Escalar el valor compound para que no sea tan extremo (1.0)
+        if compound > 0.3:
+            # Reducir valores muy positivos
+            compound = 0.1 + (compound * 0.5)
+        elif compound < -0.3:
+            # Reducir valores muy negativos
+            compound = -0.1 + (compound * 0.5)
+        
+        # Asegurar que compound está en el rango [-1, 1]
+        compound = max(-1.0, min(1.0, compound))
+        
+        print(f"Análisis de sentimiento ajustado: compound={compound}, pos={positive}, neg={negative}, neu={neutral}")
+        
+        return {
+            'compound': compound,
+            'neg': negative, 
+            'pos': positive, 
+            'neu': neutral
+        }
     except Exception as e:
         print(f"Error en analyze_news_sentiment: {str(e)}")
-        # En caso de error, devolver neutral
+        # En caso de error, devolver neutral balanceado
         return {
             'compound': 0.0,
-            'positive': 0.0, 
-            'negative': 0.0, 
-            'neutral': 1.0
+            'neg': 0.33, 
+            'pos': 0.33, 
+            'neu': 0.34
         }
 
 @app.route('/')
@@ -223,6 +284,38 @@ def market_prediction():
         
         # Obtener predicciones de precio
         price_predictions = predict_stock(symbol)
+        
+        # Calcular porcentajes de cambio para evitar NaN%
+        if price_predictions and len(price_predictions) > 1:
+            # Obtener precios actuales para referencia
+            try:
+                current_price = float(yf.Ticker(symbol).history(period="1d")['Close'].iloc[-1])
+                print(f"Precio actual de {symbol}: {current_price}")
+            except Exception as e:
+                print(f"Error al obtener precio actual: {str(e)}")
+                # Usar el primer precio de predicción como referencia si no podemos obtener el actual
+                current_price = float(price_predictions[0]['yhat'])
+            
+            # Añadir campos de porcentaje de cambio a cada predicción
+            for i, pred in enumerate(price_predictions):
+                # Agregar porcentaje de cambio con respecto al precio actual
+                try:
+                    pred_price = float(pred['yhat'])
+                    pct_change = ((pred_price - current_price) / current_price) * 100
+                    pred['pct_change'] = round(pct_change, 2)
+                    
+                    # También calcular el cambio respecto al día anterior en la predicción
+                    if i > 0:
+                        prev_price = float(price_predictions[i-1]['yhat'])
+                        daily_pct = ((pred_price - prev_price) / prev_price) * 100
+                        pred['daily_pct'] = round(daily_pct, 2)
+                    else:
+                        # Para el primer día, usar el cambio respecto al precio actual
+                        pred['daily_pct'] = round(pct_change, 2)
+                except Exception as e:
+                    print(f"Error al calcular porcentajes para predicción {i}: {str(e)}")
+                    pred['pct_change'] = 0.0
+                    pred['daily_pct'] = 0.0
         
         # Obtener análisis de sentimiento
         news_articles = get_news(symbol)
