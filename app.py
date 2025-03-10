@@ -339,6 +339,52 @@ def market_prediction():
         # Devolver un mensaje de error y código de estado 500
         return jsonify({"error": str(e), "message": "Error al procesar la solicitud"}), 500
 
+@app.route('/current-price', methods=['GET'])
+def current_price():
+    """Endpoint para obtener el precio actual de una acción"""
+    try:
+        symbol = request.args.get('symbol', 'AAPL')
+        
+        # Obtener datos del mercado
+        stock = yf.Ticker(symbol)
+        
+        # Obtener el precio de cierre más reciente
+        hist = stock.history(period="1d")
+        
+        if hist.empty:
+            return jsonify({"error": "No se pudieron obtener datos para este símbolo"}), 404
+            
+        current_price = float(hist['Close'].iloc[-1])
+        
+        # Obtener datos adicionales si están disponibles
+        try:
+            info = stock.info
+            company_name = info.get('shortName', symbol)
+            change = info.get('regularMarketChangePercent', 0.0)
+            previous_close = info.get('regularMarketPreviousClose', 0.0)
+            market_cap = info.get('marketCap', 0)
+            volume = info.get('volume', 0)
+        except:
+            company_name = symbol
+            change = 0.0
+            previous_close = 0.0
+            market_cap = 0
+            volume = 0
+        
+        return jsonify({
+            "symbol": symbol,
+            "price": current_price,
+            "change_percent": change,
+            "previous_close": previous_close,
+            "company_name": company_name,
+            "market_cap": market_cap,
+            "volume": volume
+        })
+        
+    except Exception as e:
+        print(f"Error obteniendo precio actual: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
 if __name__ == '__main__':
     # Modo desarrollo local
     app.run(debug=True, host='0.0.0.0')
