@@ -26,8 +26,9 @@ def get_stock_data(symbol):
 def predict_stock(symbol):
     """Predecir precios de acciones"""
     data = get_stock_data(symbol)
-    df = pd.DataFrame({'ds': data.index, 'y': data['Close']})
-    df.reset_index(inplace=True)
+    # Convertir el índice a datetime y eliminar timezone
+    df = pd.DataFrame({'ds': data.index.tz_localize(None), 'y': data['Close']})
+    df.reset_index(inplace=True, drop=True)  # Eliminar la columna 'index' duplicada
     
     model = Prophet()
     model.fit(df)
