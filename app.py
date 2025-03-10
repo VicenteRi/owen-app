@@ -178,9 +178,9 @@ def analyze_news_sentiment(news_articles):
             print("No hay noticias para analizar, devolviendo sentimiento neutral")
             return {
                 'compound': 0.0,
-                'neg': 0.33, 
-                'pos': 0.33, 
-                'neu': 0.34
+                'positive': 0.33, 
+                'negative': 0.33, 
+                'neutral': 0.34
             }
         
         # Inicializar analizador
@@ -209,9 +209,9 @@ def analyze_news_sentiment(news_articles):
             print("No se pudo analizar ningún artículo")
             return {
                 'compound': 0.0,
-                'neg': 0.33, 
-                'pos': 0.33, 
-                'neu': 0.34
+                'positive': 0.33, 
+                'negative': 0.33, 
+                'neutral': 0.34
             }
             
         # Calcular promedio de sentimientos
@@ -234,20 +234,21 @@ def analyze_news_sentiment(news_articles):
         
         print(f"Análisis de sentimiento ajustado: compound={compound}, pos={positive}, neg={negative}, neu={neutral}")
         
+        # Devolver con los nombres que espera el frontend
         return {
             'compound': compound,
-            'neg': negative, 
-            'pos': positive, 
-            'neu': neutral
+            'positive': positive, 
+            'negative': negative, 
+            'neutral': neutral
         }
     except Exception as e:
         print(f"Error en analyze_news_sentiment: {str(e)}")
         # En caso de error, devolver neutral balanceado
         return {
             'compound': 0.0,
-            'neg': 0.33, 
-            'pos': 0.33, 
-            'neu': 0.34
+            'positive': 0.33, 
+            'negative': 0.33, 
+            'neutral': 0.34
         }
 
 @app.route('/')
