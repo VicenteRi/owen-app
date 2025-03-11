@@ -2,16 +2,38 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 import yfinance as yf
 import pandas as pd
+import numpy as np
 from prophet import Prophet
+from prophet.diagnostics import cross_validation, performance_metrics
 import requests
 import nltk
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 import datetime
+from datetime import timedelta
 import os
 from finance_api import register_finance_routes
+# Modelos de predicción adicionales
+from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.tsa.stattools import adfuller
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+# Para paralelización
+import multiprocessing
+import warnings
+# Para caché
+import joblib
+import hashlib
+from pathlib import Path
+
+# Ignorar advertencias para evitar salida excesiva
+warnings.filterwarnings("ignore")
+
+# Crear directorio cache si no existe
+CACHE_DIR = Path("model_cache")
+CACHE_DIR.mkdir(exist_ok=True)
 
 # Descargar recursos necesarios para NLTK
-nltk.download('vader_lexicon')
+nltk.download('vader_lexicon', quiet=True)
 
 # Configuración
 NEWS_API_KEY = os.environ.get('NEWS_API_KEY', 'tu_clave_aquí')  # Obtener de variables de entorno o usar valor predeterminado
@@ -22,12 +44,23 @@ CORS(app)  # Habilitar CORS para todas las rutas
 # Register financial routes
 register_finance_routes(app)
 
-def get_stock_data(symbol):
+def get_stock_data(symbol, period="6mo"):
     """Obtener datos históricos de acciones"""
     try:
-        print(f"Obteniendo datos históricos para: {symbol}")
+        print(f"Obteniendo datos históricos para: {symbol} con periodo {period}")
         stock = yf.Ticker(symbol)
-        data = stock.history(period="6mo")
+        
+        # Intentar con periodos más largos para entrenar mejor el modelo
+        data = stock.history(period=period)
+        
+        # Si los datos son insuficientes, intentar con más datos
+        if len(data) < 60 and period == "6mo":
+            print(f"Datos insuficientes, intentando con periodo más largo")
+            data = stock.history(period="1y")
+            
+        if len(data) < 90 and period == "1y":
+            print(f"Datos insuficientes, intentando con periodo más largo")
+            data = stock.history(period="2y")
         
         # Verificar si obtuvimos datos
         if data.empty:
@@ -35,54 +68,409 @@ def get_stock_data(symbol):
             return pd.DataFrame()  # Devolver DataFrame vacío
             
         print(f"Obtenidos {len(data)} registros históricos para {symbol}")
+        
+        # Añadir características técnicas
+        if len(data) > 5:
+            # Media móvil de 5 y 20 días
+            data['MA5'] = data['Close'].rolling(window=5).mean()
+            data['MA20'] = data['Close'].rolling(window=20).mean()
+            
+            # Volatilidad (desviación estándar en una ventana)
+            data['Volatility'] = data['Close'].rolling(window=20).std()
+            
+            # Momentum (cambio porcentual de n días)
+            data['Momentum'] = data['Close'].pct_change(periods=5)
+            
+            # Volumen relativo (ratio respecto a la media de volumen)
+            data['RelVolume'] = data['Volume'] / data['Volume'].rolling(window=20).mean()
+            
+            # RSI (Relative Strength Index) simplificado
+            delta = data['Close'].diff()
+            gain = delta.where(delta > 0, 0)
+            loss = -delta.where(delta < 0, 0)
+            avg_gain = gain.rolling(window=14).mean()
+            avg_loss = loss.rolling(window=14).mean()
+            
+            # Evitar división por cero
+            avg_loss = avg_loss.replace(0, 0.001)
+            
+            rs = avg_gain / avg_loss
+            data['RSI'] = 100 - (100 / (1 + rs))
+            
+            # Limpiar NaNs resultantes de las ventanas móviles
+            data = data.fillna(method='bfill').fillna(method='ffill')
+        
         return data
     except Exception as e:
         print(f"Error en get_stock_data: {str(e)}")
         return pd.DataFrame()  # Devolver DataFrame vacío en caso de error
 
-def predict_stock(symbol):
-    """Predecir precios de acciones"""
+def get_model_cache_path(symbol, model_type):
+    """Genera una ruta única para guardar el modelo en caché"""
+    # Crear un hash para el símbolo y tipo de modelo
+    hash_key = hashlib.md5(f"{symbol}_{model_type}".encode()).hexdigest()
+    return CACHE_DIR / f"{symbol}_{model_type}_{hash_key}.joblib"
+
+def check_model_cache(symbol, model_type, max_age_days=1):
+    """Verifica si existe un modelo en caché y si aún es válido"""
+    cache_path = get_model_cache_path(symbol, model_type)
+    
+    if cache_path.exists():
+        # Verificar la fecha de última modificación
+        mtime = cache_path.stat().st_mtime
+        cache_date = datetime.datetime.fromtimestamp(mtime)
+        max_age = datetime.datetime.now() - timedelta(days=max_age_days)
+        
+        # Si el caché es más reciente que max_age_days
+        if cache_date > max_age:
+            try:
+                # Cargar el caché
+                cached_data = joblib.load(cache_path)
+                print(f"Usando modelo {model_type} en caché para {symbol}")
+                return cached_data
+            except Exception as e:
+                print(f"Error cargando caché: {e}")
+    
+    return None
+
+def save_model_cache(data, symbol, model_type):
+    """Guarda el modelo en caché"""
     try:
-        print(f"Obteniendo datos para predicción de: {symbol}")
-        data = get_stock_data(symbol)
+        cache_path = get_model_cache_path(symbol, model_type)
+        joblib.dump(data, cache_path)
+        print(f"Modelo {model_type} guardado en caché para {symbol}")
+    except Exception as e:
+        print(f"Error guardando caché: {e}")
+
+def test_stationarity(timeseries):
+    """Prueba si una serie de tiempo es estacionaria usando el test Augmented Dickey-Fuller"""
+    try:
+        # Test ADF
+        result = adfuller(timeseries.values)
+        p_value = result[1]
         
-        # Verificar si tenemos datos suficientes
-        if data.empty or len(data) < 5:
-            print(f"Datos insuficientes para {symbol}")
-            # Devolver datos simulados en este caso
-            return generate_mock_predictions(symbol)
+        # Si p-value es menor que 0.05, la serie es estacionaria
+        return p_value < 0.05
+    except Exception as e:
+        print(f"Error en test_stationarity: {e}")
+        return False
+
+def train_prophet_model(df, symbol, seasonality_mode='multiplicative'):
+    """Entrenar modelo Prophet con optimizaciones"""
+    # Verificar caché
+    cached_forecast = check_model_cache(symbol, 'prophet')
+    if cached_forecast is not None:
+        return cached_forecast
+    
+    try:
+        print(f"Entrenando modelo Prophet para {symbol}")
+        
+        # Configurar modelo con parámetros mejorados
+        model = Prophet(
+            seasonality_mode=seasonality_mode,  # Modo de estacionalidad
+            changepoint_prior_scale=0.05,       # Control de flexibilidad para cambios de tendencia
+            seasonality_prior_scale=10.0,       # Peso para la estacionalidad 
+            daily_seasonality=False,            # No usar estacionalidad diaria para datos financieros
+            weekly_seasonality=True,            # Usar estacionalidad semanal (patrones comerciales)
+            yearly_seasonality=True             # Usar estacionalidad anual
+        )
+        
+        # Añadir estacionalidades específicas del mercado si tenemos suficientes datos
+        if len(df) > 100:
+            # Estacionalidad mensual (efecto fin de mes, anuncios, etc.)
+            model.add_seasonality(
+                name='monthly',
+                period=30.5,
+                fourier_order=5
+            )
             
-        # Convertir el índice a datetime y eliminar timezone
-        df = pd.DataFrame({'ds': data.index.tz_localize(None), 'y': data['Close']})
-        df.reset_index(inplace=True, drop=True)  # Eliminar la columna 'index' duplicada
+            # Estacionalidad trimestral (reportes trimestrales)
+            model.add_seasonality(
+                name='quarterly',
+                period=91.25,
+                fourier_order=5
+            )
         
-        print(f"Entrenando modelo para {symbol} con {len(df)} puntos de datos")
-        model = Prophet()
+        # Ajustar modelo
         model.fit(df)
+        
+        # Generar predicciones futuras
         future = model.make_future_dataframe(periods=30)
         forecast = model.predict(future)
         
-        print(f"Predicción completada para {symbol}")
-        return forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].tail(30).to_dict(orient="records")
+        # Guardar en caché
+        forecast_result = forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].tail(30).to_dict(orient="records")
+        save_model_cache(forecast_result, symbol, 'prophet')
+        
+        return forecast_result
+    except Exception as e:
+        print(f"Error en train_prophet_model: {e}")
+        return None
+
+def train_arima_model(data, symbol):
+    """Entrena un modelo ARIMA para predicción"""
+    # Verificar caché
+    cached_forecast = check_model_cache(symbol, 'arima')
+    if cached_forecast is not None:
+        return cached_forecast
+    
+    try:
+        print(f"Entrenando modelo ARIMA para {symbol}")
+        
+        # Preparar datos
+        y = data['y'].values
+        
+        # Verificar estacionaridad
+        is_stationary = test_stationarity(data['y'])
+        d_param = 0 if is_stationary else 1
+        
+        # Parámetros ARIMA (p,d,q)
+        # p: orden autoregresivo
+        # d: grado de diferenciación 
+        # q: orden de media móvil
+        p, q = 5, 1
+        
+        # Ajustar modelo ARIMA
+        model = ARIMA(y, order=(p, d_param, q))
+        model_fit = model.fit()
+        
+        # Predecir 30 días hacia el futuro
+        forecast_steps = 30
+        forecast = model_fit.forecast(steps=forecast_steps)
+        
+        # Generar dataframe con formato similar a Prophet
+        last_date = data['ds'].iloc[-1]
+        forecast_dates = [last_date + datetime.timedelta(days=i+1) for i in range(forecast_steps)]
+        
+        # Calcular intervalos de confianza
+        # Usamos la desviación estándar de los datos históricos para estimar la incertidumbre
+        std_dev = np.std(y)
+        
+        # Crear objeto de resultado en formato compatible
+        result = []
+        for i, date in enumerate(forecast_dates):
+            pred = float(forecast[i])
+            # Asegurar que las predicciones no sean negativas
+            pred = max(pred, 0.01)
+            
+            # Intervalos de confianza
+            confidence_interval = std_dev * (1 + i * 0.05)  # Aumentar con el tiempo
+            
+            result.append({
+                'ds': date.strftime('%Y-%m-%d'),
+                'yhat': round(pred, 2),
+                'yhat_lower': round(max(pred - confidence_interval, 0.01), 2),
+                'yhat_upper': round(pred + confidence_interval, 2)
+            })
+        
+        # Guardar en caché
+        save_model_cache(result, symbol, 'arima')
+        
+        return result
+    except Exception as e:
+        print(f"Error en train_arima_model: {e}")
+        return None
+
+def combine_forecasts(prophet_forecast, arima_forecast, ensemble_weights=None):
+    """Combina las predicciones de diferentes modelos usando un enfoque de ponderación"""
+    if prophet_forecast is None and arima_forecast is None:
+        return None
+    
+    # Usar pesos por defecto si no se proporcionan
+    if ensemble_weights is None:
+        # Dar más peso a Prophet en general
+        ensemble_weights = {'prophet': 0.7, 'arima': 0.3}
+    
+    try:
+        # Si solo tenemos una predicción, devolver esa
+        if prophet_forecast is None:
+            return arima_forecast
+        if arima_forecast is None:
+            return prophet_forecast
+        
+        # Convertir a dataframes para facilitar la combinación
+        df_prophet = pd.DataFrame(prophet_forecast)
+        df_arima = pd.DataFrame(arima_forecast)
+        
+        # Asegurar que las fechas coincidan
+        df_prophet['ds'] = pd.to_datetime(df_prophet['ds'])
+        df_arima['ds'] = pd.to_datetime(df_arima['ds'])
+        
+        # Combinar por fecha
+        df_result = df_prophet.merge(
+            df_arima, 
+            on='ds', 
+            suffixes=('_prophet', '_arima')
+        )
+        
+        # Combinar predicciones con ponderación
+        df_result['yhat'] = (
+            df_result['yhat_prophet'] * ensemble_weights['prophet'] + 
+            df_result['yhat_arima'] * ensemble_weights['arima']
+        )
+        
+        # Ajustar los intervalos de predicción
+        df_result['yhat_lower'] = (
+            df_result['yhat_lower_prophet'] * ensemble_weights['prophet'] + 
+            df_result['yhat_lower_arima'] * ensemble_weights['arima']
+        )
+        
+        df_result['yhat_upper'] = (
+            df_result['yhat_upper_prophet'] * ensemble_weights['prophet'] + 
+            df_result['yhat_upper_arima'] * ensemble_weights['arima']
+        )
+        
+        # Reformatear para devolver
+        result = df_result[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].to_dict(orient="records")
+        
+        # Convertir fechas a string para JSON
+        for item in result:
+            item['ds'] = item['ds'].strftime('%Y-%m-%d')
+            item['yhat'] = round(item['yhat'], 2)
+            item['yhat_lower'] = round(item['yhat_lower'], 2)
+            item['yhat_upper'] = round(item['yhat_upper'], 2)
+        
+        return result
+    except Exception as e:
+        print(f"Error combinando predicciones: {e}")
+        # En caso de error, devolver la predicción de Prophet si está disponible
+        if prophet_forecast is not None:
+            return prophet_forecast
+        return arima_forecast
+
+def predict_stock(symbol):
+    """Predecir precios de acciones con múltiples modelos avanzados"""
+    try:
+        print(f"Obteniendo datos para predicción de: {symbol}")
+        # Obtener más datos históricos para mejorar la predicción
+        data = get_stock_data(symbol, period="1y")
+        
+        # Verificar si tenemos datos suficientes
+        if data.empty or len(data) < 30:
+            print(f"Datos insuficientes para {symbol} ({len(data) if not data.empty else 0} puntos)")
+            # Intentar con más datos
+            data = get_stock_data(symbol, period="2y")
+            
+            if data.empty or len(data) < 30:
+                print("Aún insuficiente, usando datos simulados")
+                return generate_mock_predictions(symbol)
+        
+        # Preparar datos para Prophet
+        df = pd.DataFrame({
+            'ds': data.index.tz_localize(None),
+            'y': data['Close']
+        })
+        df.reset_index(inplace=True, drop=True)
+        
+        # Ejecutar ambos modelos en paralelo usando multiprocessing
+        with multiprocessing.Pool(processes=2) as pool:
+            # Iniciar ambos procesos de entrenamiento
+            prophet_result = pool.apply_async(train_prophet_model, (df, symbol))
+            arima_result = pool.apply_async(train_arima_model, (df, symbol))
+            
+            # Esperar resultados
+            prophet_forecast = None
+            arima_forecast = None
+            
+            try:
+                prophet_forecast = prophet_result.get(timeout=60)  # 60 segundos timeout
+                print(f"Prophet completado para {symbol}")
+            except Exception as e:
+                print(f"Error en Prophet: {e}")
+            
+            try:
+                arima_forecast = arima_result.get(timeout=60)  # 60 segundos timeout
+                print(f"ARIMA completado para {symbol}")
+            except Exception as e:
+                print(f"Error en ARIMA: {e}")
+        
+        # Combinar predicciones
+        ensemble_result = combine_forecasts(prophet_forecast, arima_forecast)
+        
+        # Si todo falla, usar datos simulados
+        if ensemble_result is None:
+            print("Error en todos los modelos, usando datos simulados")
+            return generate_mock_predictions(symbol)
+        
+        print(f"Predicción de ensamble completada para {symbol}")
+        return ensemble_result
     except Exception as e:
         print(f"Error en predict_stock: {str(e)}")
         # En caso de error, devolver datos simulados
         return generate_mock_predictions(symbol)
 
 def generate_mock_predictions(symbol):
-    """Generar predicciones simuladas cuando hay errores"""
+    """Generar predicciones simuladas cuando hay errores - Versión mejorada"""
     print(f"Generando predicciones simuladas para {symbol}")
     today = datetime.datetime.now()
     predictions = []
     
-    # Generar un precio base usando el hash del símbolo para que sea consistente
-    seed = sum(ord(c) for c in symbol)
-    base_price = 100.0 + (seed % 200)  # Precio base entre 100 y 300
+    # Intentar obtener precio actual real
+    try:
+        stock = yf.Ticker(symbol)
+        hist = stock.history(period="1d")
+        if not hist.empty:
+            base_price = float(hist['Close'].iloc[-1])
+            print(f"Usando precio actual real: {base_price} para simulación")
+        else:
+            raise ValueError("Sin datos actuales")
+    except Exception as e:
+        print(f"No se pudo obtener precio actual: {e}")
+        # Generar un precio base usando el hash del símbolo para que sea consistente
+        seed = sum(ord(c) for c in symbol)
+        base_price = 100.0 + (seed % 200)  # Precio base entre 100 y 300
     
-    # Tendencia diaria (entre -0.5% y +1.5%)
-    trend = 0.5 + (seed % 10) / 10.0  # Entre 0.5% y 1.5%
-    if seed % 3 == 0:  # Un tercio de las veces, tendencia negativa
-        trend = -trend / 2  # Tendencia negativa más suave
+    # Analizar tendencias recientes para hacer simulación más realista
+    try:
+        # Obtener datos de los últimos 30 días
+        recent_data = stock.history(period="1mo")
+        if len(recent_data) > 5:
+            # Calcular tendencia reciente (cambio porcentual promedio)
+            changes = recent_data['Close'].pct_change().dropna()
+            avg_change = changes.mean() * 100  # En porcentaje
+            
+            # Calcular volatilidad
+            volatility = changes.std() * 100  # En porcentaje
+            
+            # Ajustar simulación con datos reales
+            print(f"Tendencia reciente: {avg_change:.2f}%, volatilidad: {volatility:.2f}%")
+            
+            # Usar tendencia real con una suavización
+            trend = avg_change * 0.7  # Suavizar para no exagerar
+            
+            # Volatilidad diaria basada en datos reales (con un mínimo razonable)
+            daily_vol = max(0.5, volatility * 0.8)  # Al menos 0.5% de volatilidad
+        else:
+            raise ValueError("Datos históricos insuficientes")
+    except Exception as e:
+        print(f"Usando tendencia y volatilidad simuladas: {e}")
+        # Tendencia diaria (entre -0.5% y +1.5%)
+        seed = sum(ord(c) for c in symbol)
+        trend = 0.5 + (seed % 10) / 10.0  # Entre 0.5% y 1.5%
+        if seed % 3 == 0:  # Un tercio de las veces, tendencia negativa
+            trend = -trend / 2  # Tendencia negativa más suave
+        
+        # Volatilidad diaria
+        daily_vol = 0.8  # 0.8% por defecto
+    
+    # Crear ciclos en los datos simulados para mayor realismo
+    # Frecuencias de ciclos
+    cycles = []
+    cycle_count = 2 + (sum(ord(c) for c in symbol) % 3)  # 2-4 ciclos
+    
+    for i in range(cycle_count):
+        # Periodo del ciclo (entre 5 y 15 días)
+        period = 5 + (ord(symbol[i % len(symbol)]) % 10)
+        # Amplitud (entre 0.5% y 2% del precio)
+        amplitude = base_price * (0.005 + (ord(symbol[i % len(symbol)]) % 15) / 1000)
+        # Fase inicial
+        phase = (ord(symbol[i % len(symbol)]) % 100) / 100 * 2 * np.pi
+        
+        cycles.append({
+            'period': period,
+            'amplitude': amplitude,
+            'phase': phase
+        })
     
     current_price = base_price
     
@@ -90,22 +478,49 @@ def generate_mock_predictions(symbol):
         # Generar una fecha futura
         future_date = today + datetime.timedelta(days=i)
         
-        # Calcular variación diaria (ruido aleatorio)
-        daily_variation = ((seed + i) % 10 - 4) / 10.0  # Entre -0.4% y +0.5%
+        # Efecto tendencia
+        trend_effect = trend * i / 100  # Efecto acumulativo
         
-        # Aplicar tendencia y variación
+        # Efecto ciclos
+        cycle_effect = 0
+        for cycle in cycles:
+            # Efecto sinusoidal
+            t = i / cycle['period']
+            cycle_effect += cycle['amplitude'] * np.sin(2 * np.pi * t + cycle['phase'])
+        
+        # Efecto memoria (autocorrelación)
+        memory_effect = 0
         if i > 0:
-            current_price = predictions[i-1]['yhat'] * (1 + (trend + daily_variation) / 100)
+            # El precio reciente influye en el siguiente (efecto memoria)
+            price_diff = predictions[i-1]['yhat'] - base_price
+            memory_effect = price_diff * 0.2  # 20% de la diferencia anterior
         
-        # Calcular límites inferior y superior
-        lower_bound = current_price * (1 - (0.5 + (i * 0.1)) / 100)
-        upper_bound = current_price * (1 + (0.5 + (i * 0.1)) / 100)
+        # Calcular variación diaria (ruido aleatorio basado en volatilidad)
+        noise = current_price * (daily_vol / 100) * ((hash(f"{symbol}_{i}") % 100) / 50 - 1)
+        
+        # Calcular nuevo precio combinando todos los efectos
+        if i > 0:
+            # Usar precio anterior como base para el siguiente
+            base_for_calc = predictions[i-1]['yhat']
+            # Añadir efectos
+            current_price = base_for_calc * (1 + trend_effect) + cycle_effect + memory_effect + noise
+        else:
+            # Para el primer día, usar el precio base
+            current_price = base_price * (1 + trend_effect) + cycle_effect + noise
+        
+        # Asegurar que el precio no sea negativo
+        current_price = max(current_price, 0.01)
+        
+        # Calcular límites inferior y superior (más amplios con el tiempo)
+        confidence_interval = (daily_vol / 100) * current_price * (1 + i * 0.05)
+        lower_bound = current_price - confidence_interval
+        upper_bound = current_price + confidence_interval
         
         # Crear predicción
         prediction = {
             'ds': future_date.strftime("%Y-%m-%d"),
             'yhat': round(current_price, 2),
-            'yhat_lower': round(lower_bound, 2),
+            'yhat_lower': round(max(lower_bound, 0.01), 2),
             'yhat_upper': round(upper_bound, 2)
         }
         
