@@ -385,6 +385,108 @@ def current_price():
         print(f"Error obteniendo precio actual: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
+@app.route('/search', methods=['GET'])
+def search_symbols():
+    """Endpoint para buscar símbolos de acciones"""
+    try:
+        # Obtener el término de búsqueda
+        query = request.args.get('query', '')
+        print(f"Buscando símbolos con consulta: {query}")
+        
+        if not query:
+            # Si no hay consulta, devolver algunas acciones populares
+            popular_stocks = [
+                {"symbol": "AAPL", "name": "Apple Inc."},
+                {"symbol": "MSFT", "name": "Microsoft Corporation"},
+                {"symbol": "GOOGL", "name": "Alphabet Inc."},
+                {"symbol": "AMZN", "name": "Amazon.com, Inc."},
+                {"symbol": "TSLA", "name": "Tesla, Inc."},
+                {"symbol": "META", "name": "Meta Platforms, Inc."},
+                {"symbol": "NVDA", "name": "NVIDIA Corporation"},
+                {"symbol": "NFLX", "name": "Netflix, Inc."},
+                {"symbol": "JPM", "name": "JPMorgan Chase & Co."},
+                {"symbol": "DIS", "name": "The Walt Disney Company"}
+            ]
+            return jsonify(popular_stocks)
+        
+        # Realizar búsqueda usando yfinance
+        import yfinance as yf
+        
+        # Usar tickers.search() si está disponible, de lo contrario usar un enfoque personalizado
+        try:
+            # Intento usar método moderno de búsqueda (si está disponible)
+            tickers = yf.Tickers('')
+            results = tickers.tickers
+            search_results = []
+            
+            # Filtrar resultados que coincidan con la consulta
+            for symbol, ticker in results.items():
+                try:
+                    info = ticker.info
+                    if 'shortName' in info and (
+                        query.lower() in symbol.lower() or 
+                        query.lower() in info['shortName'].lower()
+                    ):
+                        search_results.append({
+                            "symbol": symbol,
+                            "name": info.get('shortName', symbol)
+                        })
+                except:
+                    continue
+                
+                # Limitar a 20 resultados
+                if len(search_results) >= 20:
+                    break
+            
+            return jsonify(search_results)
+        
+        except Exception as inner_e:
+            print(f"Método de búsqueda avanzado falló: {str(inner_e)}")
+            # Método alternativo: buscar símbolos comunes que coincidan con la consulta
+            common_symbols = {
+                "AAPL": "Apple Inc.",
+                "MSFT": "Microsoft Corporation",
+                "GOOGL": "Alphabet Inc.",
+                "AMZN": "Amazon.com, Inc.",
+                "TSLA": "Tesla, Inc.",
+                "META": "Meta Platforms, Inc.",
+                "NVDA": "NVIDIA Corporation",
+                "NFLX": "Netflix, Inc.",
+                "JPM": "JPMorgan Chase & Co.",
+                "DIS": "The Walt Disney Company",
+                "V": "Visa Inc.",
+                "PG": "Procter & Gamble Co.",
+                "JNJ": "Johnson & Johnson",
+                "KO": "The Coca-Cola Company",
+                "CSCO": "Cisco Systems, Inc.",
+                "MCD": "McDonald's Corporation",
+                "ADBE": "Adobe Inc.",
+                "INTC": "Intel Corporation",
+                "IBM": "International Business Machines",
+                "PYPL": "PayPal Holdings, Inc.",
+                "BA": "Boeing Company",
+                "GE": "General Electric Company",
+                "VZ": "Verizon Communications Inc.",
+                "T": "AT&T Inc.",
+                "WMT": "Walmart Inc.",
+                "TGT": "Target Corporation",
+                "F": "Ford Motor Company",
+                "GM": "General Motors Company",
+                "NKE": "Nike, Inc.",
+                "HD": "Home Depot, Inc."
+            }
+            
+            results = []
+            for symbol, name in common_symbols.items():
+                if query.lower() in symbol.lower() or query.lower() in name.lower():
+                    results.append({"symbol": symbol, "name": name})
+            
+            return jsonify(results)
+            
+    except Exception as e:
+        print(f"Error en búsqueda de símbolos: {str(e)}")
+        return jsonify([]), 500
+
 if __name__ == '__main__':
     # Modo desarrollo local
     app.run(debug=True, host='0.0.0.0')
